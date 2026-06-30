@@ -35,6 +35,11 @@ export async function main(argv) {
     return;
   }
 
+  if (options.action === 'hub') {
+    await runHub(options);
+    return;
+  }
+
   if (options.action === 'next') {
     await jumpToNext(options);
     return;
@@ -74,7 +79,7 @@ export function parseArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if ((arg === 'jump' || arg === 'next' || arg === 'register') && options.action === 'snapshot') {
+    if ((arg === 'hub' || arg === 'jump' || arg === 'next' || arg === 'register') && options.action === 'snapshot') {
       options.action = arg;
       continue;
     }
@@ -112,6 +117,7 @@ export function parseArgs(argv) {
 
   if (options.action === 'jump' && !options.target) throw new Error('jump requires a target like session:window.pane');
   if (options.action === 'register' && !options.paneId) throw new Error('register requires --pane-id or TMUX_PANE');
+  if (options.action === 'hub' && options.json) throw new Error('hub is interactive; use snapshot --json instead');
   if (options.action !== 'snapshot' && options.watch) throw new Error('--watch only works with snapshots');
   return options;
 }
@@ -129,6 +135,77 @@ export async function jumpToNext(options = {}) {
   const row = firstMatch(rows, options.selector || 'attention');
   if (!row) throw new Error(`no pane matches ${options.selector || 'attention'}`);
   await jumpToTarget(options.tmux || 'tmux', row.target);
+}
+
+export async function runHub(options = {}) {
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  if (!stdin.isTTY || !stdout.isTTY || typeof stdin.setRawMode !== 'function') throw new Error('hub requires an interactive terminal');
+
+  let rows = [];
+  let selected = 0;
+  let status = '';
+  let stopped = false;
+  let refreshing = false;
+  const previousRaw = stdin.isRaw;
+
+  const refresh = async (nextStatus = status) => {
+    if (stopped || refreshing) return;
+    refreshing = true;
+    try {
+      rows = await snapshot(options);
+      status = nextStatus;
+    } catch {
+      rows = [];
+      status = 'snapshot failed';
+    } finally {
+      selected = hubSelectionIndex(selected, rows.length);
+      if (!stopped) stdout.write(`\x1b[H\x1b[2J${renderHub(rows, selected, options, status)}\n`);
+      refreshing = false;
+    }
+  };
+
+  let timer;
+  let resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    stdin.off('data', onKey);
+    stdin.setRawMode(previousRaw);
+    stdout.write('\x1b[?25h\x1b[?1049l');
+    resolveDone();
+  };
+  const jump = async (row) => {
+    if (!row) {
+      await refresh('no matching pane');
+      return;
+    }
+    try {
+      await jumpToTarget(options.tmux || 'tmux', row.target);
+      await refresh(`jumped ${row.target}`);
+    } catch {
+      await refresh('jump failed');
+    }
+  };
+  const onKey = (data) => {
+    const key = data.toString('utf8');
+    if (key === '\u0003' || key === '\u001b' || key === 'q') stop();
+    else if (key === 'j' || key === '\u001b[B') { selected = hubSelectionIndex(selected + 1, rows.length); void refresh(); }
+    else if (key === 'k' || key === '\u001b[A') { selected = hubSelectionIndex(selected - 1, rows.length); void refresh(); }
+    else if (key === 'r') void refresh('refreshed');
+    else if (key === 'n') void jump(firstMatch(rows, 'attention'));
+    else if (key === '\r' || key === '\n') void jump(rows[selected]);
+  };
+
+  stdout.write('\x1b[?1049h\x1b[?25l');
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.on('data', onKey);
+  timer = setInterval(() => { void refresh(); }, options.interval * 1000);
+  await refresh();
+  return done;
 }
 
 function firstMatch(rows, selector) {
@@ -484,10 +561,31 @@ function describePi(pi) {
 }
 
 export function renderTable(rows) {
-  const table = [
+  return renderCells([
     ['STATE', 'TARGET', 'CMD', 'DIR', 'ADAPTER', 'PI NAME', 'LAST', 'AGE'],
     ...rows.map((row) => [row.state, row.target, row.command, row.directory, row.adapter, row.name, row.last, row.age]),
-  ];
+  ]);
+}
+
+export function renderHub(rows, selected = 0, options = {}, status = '') {
+  const view = rows.map((row) => publicRow(row, options));
+  const table = renderCells([
+    ['', 'STATE', 'TARGET', 'CMD', 'DIR', 'ADAPTER', 'PI NAME', 'LAST', 'AGE'],
+    ...view.map((row, index) => [index === selected ? '›' : ' ', row.state, row.target, row.command, row.directory, row.adapter, row.name, row.last, row.age]),
+  ]);
+  return [
+    'pi-tmux-hub hub  ↑/k ↓/j select  enter jump  n attention  r refresh  q quit',
+    status ? `status: ${status}` : '',
+    table,
+  ].filter(Boolean).join('\n');
+}
+
+export function hubSelectionIndex(index, count) {
+  if (count < 1) return 0;
+  return ((index % count) + count) % count;
+}
+
+function renderCells(table) {
   const widths = table[0].map((_, index) => Math.max(...table.map((row) => printable(row[index]).length)));
   return table.map((row) => row.map((cell, index) => printable(cell).padEnd(widths[index])).join('  ').trimEnd()).join('\n');
 }
@@ -539,11 +637,15 @@ function helpText() {
 
 Usage:
   pi-tmux-hub [--json] [--watch] [--interval <seconds>] [--full-paths]
+  pi-tmux-hub hub [--interval <seconds>]
   pi-tmux-hub jump <session:window.pane>
   pi-tmux-hub next [attention|error|working|waiting|target|name]
   pi-tmux-hub register --state <working|waiting|error|stopped>
 
 Read-only tmux snapshot plus deterministic tmux navigation. No network, no tokens.
+
+Commands:
+  hub                    Open the interactive live selector.
 
 Options:
   --json                 Print machine-readable rows.

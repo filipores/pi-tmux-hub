@@ -7,6 +7,7 @@ import path from 'node:path';
 import piTmuxHubSensor from '../extensions/pi-tmux-hub-sensor.js';
 import {
   classifyPane,
+  hubSelectionIndex,
   jumpToTarget,
   latestPiSessionForCwd,
   parseArgs,
@@ -17,6 +18,7 @@ import {
   publicRow,
   readRegistry,
   registerCurrentPane,
+  renderHub,
   renderTable,
   snapshot,
   writeRegistryEntry,
@@ -250,6 +252,31 @@ test('default public rows and table hide full local paths', () => {
   assert.doesNotMatch(JSON.stringify(row) + table, /\/Users\/dev/);
 });
 
+test('interactive hub renders selection without leaking paths', () => {
+  const hub = renderHub([
+    {
+      adapter: 'pi',
+      command: 'node',
+      cwd: '/Users/dev/SECRET_HUB_REPO',
+      cwdName: 'SECRET_HUB_REPO',
+      pi: {
+        file: '/Users/dev/.pi/agent/sessions/SECRET/session.jsonl',
+        name: 'Hub task',
+        registryUpdatedAt: new Date(),
+        registryState: 'working',
+      },
+      state: 'working',
+      target: 'work:0.0',
+    },
+  ], 0);
+
+  assert.match(hub, /›\s+working\s+work:0\.0/);
+  assert.match(hub, /enter jump/);
+  assert.doesNotMatch(hub, /\/Users\/dev/);
+  assert.equal(hubSelectionIndex(-1, 3), 2);
+  assert.equal(hubSelectionIndex(3, 3), 0);
+});
+
 test('argument parser keeps watch cheap and explicit', () => {
   const watch = parseArgs(['--json', '--watch', '--interval', '2', '--pi-root=/tmp/pi', '--tmux', 'tmux']);
   assert.equal(watch.action, 'snapshot');
@@ -269,7 +296,12 @@ test('argument parser keeps watch cheap and explicit', () => {
   assert.equal(register.state, 'waiting');
   assert.equal(register.registryDir, '/tmp/registry');
 
+  const hub = parseArgs(['hub', '--interval', '1']);
+  assert.equal(hub.action, 'hub');
+  assert.equal(hub.interval, 1);
+
   assert.equal(parseArgs(['next', 'working']).selector, 'working');
+  assert.throws(() => parseArgs(['hub', '--json']), /interactive/);
   assert.throws(() => parseArgs(['--interval', '0']), /positive integer/);
   assert.throws(() => parseArgs(['--state', 'bad']), /unknown registry state/);
   assert.throws(() => parseArgs(['jump']), /jump requires/);

@@ -8,6 +8,7 @@ It does not run an LLM, call the network, or try to become the agent runtime. tm
 
 ```bash
 pi-tmux-hub
+pi-tmux-hub hub
 pi-tmux-hub --watch
 pi-tmux-hub --json
 pi-tmux-hub jump agents:1.0
@@ -20,6 +21,7 @@ During local development:
 
 ```bash
 node bin/pi-tmux-hub.js
+node bin/pi-tmux-hub.js hub
 node bin/pi-tmux-hub.js --watch --interval 2
 ```
 
@@ -55,6 +57,23 @@ pi-tmux-hub register --state working --pane-id "$TMUX_PANE" --session-file /path
 pi-tmux-hub register --state waiting --pane-id "$TMUX_PANE" --session-file /path/to/session.jsonl
 ```
 
+## Interactive hub
+
+Run the live selector inside tmux:
+
+```bash
+pi-tmux-hub hub
+```
+
+Keys:
+
+- `j` / `↓`: select next row
+- `k` / `↑`: select previous row
+- `Enter`: jump to selected pane
+- `n`: jump to first attention pane (`error`, then `working`, then `waiting`)
+- `r`: refresh
+- `q`: quit
+
 ## Navigation
 
 Use the `TARGET` column to jump into a session:
@@ -79,6 +98,7 @@ pi-tmux-hub next "Fix parser"
 ## Options
 
 ```text
+hub                    Open the interactive live selector.
 --json                 Print machine-readable rows.
 --watch                Refresh until interrupted.
 --interval <seconds>   Watch refresh interval. Default: 5.
@@ -91,7 +111,7 @@ pi-tmux-hub next "Fix parser"
 
 ## Privacy posture
 
-- Snapshot mode is read-only; `jump`/`next` only switch tmux focus.
+- Snapshot and hub display are read-only; `jump`/`next`/hub Enter only switch tmux focus.
 - No network calls.
 - No token usage.
 - No prompt or code text is printed.
@@ -99,7 +119,7 @@ pi-tmux-hub next "Fix parser"
 
 ## MVP limits
 
-- Snapshot/watch plus tmux focus switching only; no `steer`, `follow_up`, or `abort` yet.
+- Hub navigation plus tmux focus switching only; no `steer`, `follow_up`, or `abort` yet.
 - Without the Pi sensor, Pi detection falls back to cwd + latest session JSONL.
 - tmux is required.
 
