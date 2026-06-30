@@ -13,6 +13,7 @@ pi-tmux-hub --json
 pi-tmux-hub jump agents:1.0
 pi-tmux-hub next
 pi-tmux-hub next working
+pi-tmux-hub register --state working
 ```
 
 During local development:
@@ -33,8 +34,26 @@ tmux     work:1.1  zsh   scratch   tmux     -           -     -
 ## What it watches
 
 - `tmux list-panes -a` for panes, commands, and current directories.
-- `~/.pi/agent/sessions` for the latest Pi JSONL session matching a pane cwd.
+- `~/.pi-tmux-hub/registry` for exact pane → Pi session mappings from the Pi sensor.
+- `~/.pi/agent/sessions` as a cwd-based fallback when no registry entry exists.
 - `/name` / `--name` metadata when Pi has written `session_info` entries.
+
+## Dynamic Pi sensor
+
+Install this repo as a Pi package to load the tiny sensor extension:
+
+```bash
+pi install git:github.com/filipores/pi-tmux-hub
+```
+
+When Pi runs inside tmux, the sensor writes only local registry metadata: pane id, cwd, Pi session file, pid, state, last event/tool. It never writes prompt/code content and never calls the network.
+
+For custom Dynamic Workflow hooks, the same registry can be updated directly:
+
+```bash
+pi-tmux-hub register --state working --pane-id "$TMUX_PANE" --session-file /path/to/session.jsonl
+pi-tmux-hub register --state waiting --pane-id "$TMUX_PANE" --session-file /path/to/session.jsonl
+```
 
 ## Navigation
 
@@ -65,6 +84,7 @@ pi-tmux-hub next "Fix parser"
 --interval <seconds>   Watch refresh interval. Default: 5.
 --full-paths           Show cwd and Pi session file paths. Hidden by default.
 --pi-root <dir>        Pi session root. Default: ~/.pi/agent/sessions.
+--registry-dir <dir>   Pi/tmux registry dir. Default: ~/.pi-tmux-hub/registry.
 --tmux <binary>        tmux binary. Default: tmux.
 -h, --help             Show help.
 ```
@@ -80,7 +100,7 @@ pi-tmux-hub next "Fix parser"
 ## MVP limits
 
 - Snapshot/watch plus tmux focus switching only; no `steer`, `follow_up`, or `abort` yet.
-- Pi detection is cwd + latest session JSONL, not RPC live state.
+- Without the Pi sensor, Pi detection falls back to cwd + latest session JSONL.
 - tmux is required.
 
-Next useful slice: add optional RPC-backed sessions for exact live state and manual controls.
+Next useful slice: add optional manual controls for live Pi sessions.

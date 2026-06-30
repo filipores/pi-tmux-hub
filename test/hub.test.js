@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import piTmuxHubSensor from '../extensions/pi-tmux-hub-sensor.js';
 import {
   classifyPane,
   jumpToTarget,
@@ -14,7 +15,11 @@ import {
   parseTmuxPanes,
   piSessionDirNames,
   publicRow,
+  readRegistry,
+  registerCurrentPane,
   renderTable,
+  snapshot,
+  writeRegistryEntry,
 } from '../src/hub.js';
 
 test('parses tmux pane rows', () => {
@@ -87,6 +92,99 @@ test('finds latest Pi session for cwd', async () => {
   assert.doesNotMatch(JSON.stringify(session), /PROMPT_SENTINEL/);
 });
 
+test('registry maps two Pi sessions in the same cwd to distinct panes', async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-registry-'));
+  const cwd = path.join(tmp, 'repo');
+  const piRoot = path.join(tmp, 'pi-sessions');
+  const registryDir = path.join(tmp, 'registry');
+  const tmux = path.join(tmp, 'tmux');
+  const sessionDir = path.join(piRoot, piSessionDirNames(cwd)[0]);
+  await mkdir(cwd);
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(tmux, `#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' work 0 0 %1 node ${shellQuote(cwd)} pi\nprintf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' work 0 1 %2 node ${shellQuote(cwd)} pi\n`, { mode: 0o755 });
+
+  const firstSession = path.join(sessionDir, 'first.jsonl');
+  const secondSession = path.join(sessionDir, 'second.jsonl');
+  await writeFile(firstSession, [
+    JSON.stringify({ type: 'session', id: 's1', timestamp: '2026-01-01T00:00:00.000Z', cwd }),
+    JSON.stringify({ type: 'session_info', name: 'First task' }),
+    JSON.stringify({ type: 'message', timestamp: '2026-01-01T00:00:01.000Z', message: { role: 'assistant', stopReason: 'stop', content: 'PROMPT_SENTINEL' } }),
+  ].join('\n'));
+  await writeFile(secondSession, [
+    JSON.stringify({ type: 'session', id: 's2', timestamp: '2026-01-01T00:00:00.000Z', cwd }),
+    JSON.stringify({ type: 'session_info', name: 'Second task' }),
+    JSON.stringify({ type: 'message', timestamp: '2026-01-01T00:00:01.000Z', message: { role: 'assistant', stopReason: 'stop', content: 'CODE_SENTINEL' } }),
+  ].join('\n'));
+
+  await writeRegistryEntry({ cwd, paneId: '%1', pid: process.pid, sessionFile: firstSession, state: 'working', last: 'agent_start' }, registryDir);
+  await writeRegistryEntry({ cwd, paneId: '%2', pid: process.pid, sessionFile: secondSession, state: 'waiting', last: 'stop' }, registryDir);
+
+  const rows = await snapshot({ piRoot, registryDir, tmux });
+
+  assert.equal(rows.find((row) => row.paneId === '%1').pi.name, 'First task');
+  assert.equal(rows.find((row) => row.paneId === '%1').state, 'working');
+  assert.equal(rows.find((row) => row.paneId === '%2').pi.name, 'Second task');
+  assert.equal(rows.find((row) => row.paneId === '%2').state, 'waiting');
+  assert.doesNotMatch(JSON.stringify(rows.map((row) => publicRow(row))), /PROMPT_SENTINEL|CODE_SENTINEL/);
+});
+
+test('register command writes privacy-safe pane registry', async () => {
+  const registryDir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-register-'));
+
+  await registerCurrentPane({ cwd: '/SECRET_CWD_SENTINEL', last: 'tool_call', lastToolName: 'bash', paneId: '%7', pid: process.pid, registryDir, state: 'working' });
+  const [entry] = await readRegistry(registryDir);
+
+  assert.equal(entry.paneId, '%7');
+  assert.equal(entry.state, 'working');
+  assert.equal(entry.lastToolName, 'bash');
+  assert.equal(JSON.stringify(entry).includes('PROMPT_SENTINEL'), false);
+});
+
+test('register errors do not leak registry paths', async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-SECRET_REGISTRY-'));
+  const blocker = path.join(tmp, 'SECRET_REGISTRY_SENTINEL');
+  await writeFile(blocker, 'not a dir');
+
+  await assert.rejects(
+    registerCurrentPane({ paneId: '%8', registryDir: path.join(blocker, 'child'), state: 'working' }),
+    (error) => {
+      assert.match(error.message, /registry write failed/);
+      assert.doesNotMatch(error.message, /SECRET_REGISTRY_SENTINEL/);
+      return true;
+    },
+  );
+});
+
+test('Pi sensor writes live state without prompt content', async () => {
+  const registryDir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-sensor-'));
+  const oldPane = process.env.TMUX_PANE;
+  const oldRegistry = process.env.PI_TMUX_HUB_REGISTRY_DIR;
+  process.env.TMUX_PANE = '%9';
+  process.env.PI_TMUX_HUB_REGISTRY_DIR = registryDir;
+  const handlers = new Map();
+  const ctx = {
+    cwd: '/SECRET_SENSOR_CWD',
+    sessionManager: { getSessionFile: () => '/SECRET_SENSOR_SESSION/session.jsonl' },
+  };
+
+  try {
+    piTmuxHubSensor({ on: (event, handler) => handlers.set(event, handler) });
+    await handlers.get('agent_start')({}, ctx);
+    assert.equal((await readRegistry(registryDir))[0].state, 'working');
+
+    await handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'error', content: 'PROMPT_SENTINEL' }] }, ctx);
+    const [entry] = await readRegistry(registryDir);
+    assert.equal(entry.state, 'error');
+    assert.equal(entry.last, 'error');
+    assert.doesNotMatch(JSON.stringify(entry), /PROMPT_SENTINEL/);
+  } finally {
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+    if (oldRegistry === undefined) delete process.env.PI_TMUX_HUB_REGISTRY_DIR;
+    else process.env.PI_TMUX_HUB_REGISTRY_DIR = oldRegistry;
+  }
+});
+
 test('classifies Pi states from session metadata', () => {
   const pane = { command: 'node' };
 
@@ -153,34 +251,27 @@ test('default public rows and table hide full local paths', () => {
 });
 
 test('argument parser keeps watch cheap and explicit', () => {
-  assert.deepEqual(parseArgs(['--json', '--watch', '--interval', '2', '--pi-root=/tmp/pi', '--tmux', 'tmux']), {
-    action: 'snapshot',
-    fullPaths: false,
-    help: false,
-    interval: 2,
-    json: true,
-    selector: undefined,
-    target: undefined,
-    piRoot: '/tmp/pi',
-    tmux: 'tmux',
-    watch: true,
-  });
+  const watch = parseArgs(['--json', '--watch', '--interval', '2', '--pi-root=/tmp/pi', '--tmux', 'tmux']);
+  assert.equal(watch.action, 'snapshot');
+  assert.equal(watch.json, true);
+  assert.equal(watch.watch, true);
+  assert.equal(watch.interval, 2);
+  assert.equal(watch.piRoot, '/tmp/pi');
 
-  assert.deepEqual(parseArgs(['jump', 'agents:1.0']), {
-    action: 'jump',
-    fullPaths: false,
-    help: false,
-    interval: 5,
-    json: false,
-    selector: undefined,
-    target: 'agents:1.0',
-    piRoot: `${process.env.HOME}/.pi/agent/sessions`,
-    tmux: 'tmux',
-    watch: false,
-  });
+  const jump = parseArgs(['jump', 'agents:1.0']);
+  assert.equal(jump.action, 'jump');
+  assert.equal(jump.target, 'agents:1.0');
+  assert.equal(jump.piRoot, `${process.env.HOME}/.pi/agent/sessions`);
+
+  const register = parseArgs(['register', '--pane-id', '%1', '--state', 'waiting', '--registry-dir=/tmp/registry']);
+  assert.equal(register.action, 'register');
+  assert.equal(register.paneId, '%1');
+  assert.equal(register.state, 'waiting');
+  assert.equal(register.registryDir, '/tmp/registry');
 
   assert.equal(parseArgs(['next', 'working']).selector, 'working');
   assert.throws(() => parseArgs(['--interval', '0']), /positive integer/);
+  assert.throws(() => parseArgs(['--state', 'bad']), /unknown registry state/);
   assert.throws(() => parseArgs(['jump']), /jump requires/);
 });
 

@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "tmux-native monitor for Pi coding-agent sessions.",
   "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "tmux",
+    "pi"
+  ],
   "type": "module",
   "bin": {
     "pi-tmux-hub": "bin/pi-tmux-hub.js"
@@ -15,8 +20,14 @@
   "engines": {
     "node": ">=20"
   },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-tmux-hub-sensor.js"
+    ]
+  },
   "files": [
     "bin",
+    "extensions",
     "src",
     "README.md",
     "LICENSE"

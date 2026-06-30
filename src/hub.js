@@ -1,11 +1,12 @@
 import { execFile, spawn } from 'node:child_process';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 const DEFAULT_PI_ROOT = path.join(os.homedir(), '.pi', 'agent', 'sessions');
+const DEFAULT_REGISTRY_DIR = path.join(os.homedir(), '.pi-tmux-hub', 'registry');
 const TMUX_FORMAT = [
   '#{session_name}',
   '#{window_index}',
@@ -26,6 +27,11 @@ export async function main(argv) {
 
   if (options.action === 'jump') {
     await jumpToTarget(options.tmux, options.target);
+    return;
+  }
+
+  if (options.action === 'register') {
+    await registerCurrentPane(options);
     return;
   }
 
@@ -51,8 +57,16 @@ export function parseArgs(argv) {
     help: false,
     interval: 5,
     json: false,
+    last: undefined,
+    lastToolName: undefined,
+    paneId: process.env.TMUX_PANE,
+    pid: process.pid,
+    registryDir: defaultRegistryDir(),
     selector: undefined,
+    sessionFile: undefined,
+    state: 'working',
     target: undefined,
+    cwd: process.cwd(),
     piRoot: DEFAULT_PI_ROOT,
     tmux: 'tmux',
     watch: false,
@@ -60,7 +74,7 @@ export function parseArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if ((arg === 'jump' || arg === 'next') && options.action === 'snapshot') {
+    if ((arg === 'jump' || arg === 'next' || arg === 'register') && options.action === 'snapshot') {
       options.action = arg;
       continue;
     }
@@ -71,6 +85,22 @@ export function parseArgs(argv) {
     else if (arg === '--watch') options.watch = true;
     else if (arg === '--pi-root') options.piRoot = requireValue(argv, ++index, '--pi-root');
     else if (arg.startsWith('--pi-root=')) options.piRoot = requireNonEmpty(arg.slice('--pi-root='.length), '--pi-root');
+    else if (arg === '--registry-dir') options.registryDir = requireValue(argv, ++index, '--registry-dir');
+    else if (arg.startsWith('--registry-dir=')) options.registryDir = requireNonEmpty(arg.slice('--registry-dir='.length), '--registry-dir');
+    else if (arg === '--state') options.state = normalizeRegistryState(requireValue(argv, ++index, '--state'));
+    else if (arg.startsWith('--state=')) options.state = normalizeRegistryState(arg.slice('--state='.length));
+    else if (arg === '--session-file') options.sessionFile = requireValue(argv, ++index, '--session-file');
+    else if (arg.startsWith('--session-file=')) options.sessionFile = requireNonEmpty(arg.slice('--session-file='.length), '--session-file');
+    else if (arg === '--pane-id') options.paneId = requireValue(argv, ++index, '--pane-id');
+    else if (arg.startsWith('--pane-id=')) options.paneId = requireNonEmpty(arg.slice('--pane-id='.length), '--pane-id');
+    else if (arg === '--cwd') options.cwd = requireValue(argv, ++index, '--cwd');
+    else if (arg.startsWith('--cwd=')) options.cwd = requireNonEmpty(arg.slice('--cwd='.length), '--cwd');
+    else if (arg === '--last') options.last = requireValue(argv, ++index, '--last');
+    else if (arg.startsWith('--last=')) options.last = requireNonEmpty(arg.slice('--last='.length), '--last');
+    else if (arg === '--tool') options.lastToolName = requireValue(argv, ++index, '--tool');
+    else if (arg.startsWith('--tool=')) options.lastToolName = requireNonEmpty(arg.slice('--tool='.length), '--tool');
+    else if (arg === '--pid') options.pid = parsePid(requireValue(argv, ++index, '--pid'));
+    else if (arg.startsWith('--pid=')) options.pid = parsePid(arg.slice('--pid='.length));
     else if (arg === '--tmux') options.tmux = requireValue(argv, ++index, '--tmux');
     else if (arg.startsWith('--tmux=')) options.tmux = requireNonEmpty(arg.slice('--tmux='.length), '--tmux');
     else if (arg === '--interval') options.interval = parseInterval(requireValue(argv, ++index, '--interval'));
@@ -81,14 +111,16 @@ export function parseArgs(argv) {
   }
 
   if (options.action === 'jump' && !options.target) throw new Error('jump requires a target like session:window.pane');
+  if (options.action === 'register' && !options.paneId) throw new Error('register requires --pane-id or TMUX_PANE');
   if (options.action !== 'snapshot' && options.watch) throw new Error('--watch only works with snapshots');
   return options;
 }
 
 export async function snapshot(options = {}) {
-  const resolved = { piRoot: DEFAULT_PI_ROOT, tmux: 'tmux', ...options };
+  const resolved = { piRoot: DEFAULT_PI_ROOT, registryDir: defaultRegistryDir(), tmux: 'tmux', ...options };
   const panes = await listTmuxPanes(resolved.tmux);
-  const rows = await Promise.all(panes.map((pane) => enrichPane(pane, resolved.piRoot)));
+  const registryByPane = await registryEntriesForPanes(panes, resolved.registryDir);
+  const rows = await Promise.all(panes.map((pane) => enrichPane(pane, resolved.piRoot, registryByPane.get(pane.paneId))));
   return rows.sort((left, right) => left.target.localeCompare(right.target, undefined, { numeric: true }));
 }
 
@@ -171,8 +203,8 @@ export function parseTmuxPanes(stdout) {
   });
 }
 
-async function enrichPane(pane, piRoot) {
-  const pi = pane.cwd ? await latestPiSessionForCwd(pane.cwd, piRoot) : null;
+async function enrichPane(pane, piRoot, registryEntry) {
+  const pi = registryEntry ? await piSessionForRegistryEntry(registryEntry, piRoot) : (pane.cwd ? await latestPiSessionForCwd(pane.cwd, piRoot) : null);
   return {
     adapter: pi ? 'pi' : 'tmux',
     command: pane.command,
@@ -187,10 +219,145 @@ async function enrichPane(pane, piRoot) {
 
 export function classifyPane(pane, pi) {
   if (!pi) return 'tmux';
+  if (pi.registryState) return pi.registryState;
   if (pi.lastStopReason === 'error') return 'error';
   if (pi.lastRole === 'toolResult' || pi.lastRole === 'user' || pi.lastStopReason === 'toolUse') return 'working';
   if (pi.lastStopReason === 'stop') return 'waiting';
   return SHELLS.has(pane.command) ? 'idle' : 'live';
+}
+
+export async function registerCurrentPane(options = {}) {
+  try {
+    return await writeRegistryEntry({
+      cwd: options.cwd || process.cwd(),
+      last: options.last,
+      lastToolName: options.lastToolName,
+      paneId: options.paneId || process.env.TMUX_PANE,
+      pid: options.pid ?? process.pid,
+      sessionFile: options.sessionFile,
+      state: options.state || 'working',
+    }, options.registryDir || defaultRegistryDir());
+  } catch {
+    throw new Error('registry write failed');
+  }
+}
+
+export async function writeRegistryEntry(entry, registryDir = defaultRegistryDir()) {
+  const normalized = normalizeRegistryEntry({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    ...entry,
+  });
+  if (!normalized) throw new Error('invalid registry entry');
+
+  await mkdir(registryDir, { mode: 0o700, recursive: true });
+  const name = `${encodeURIComponent(normalized.paneId)}.json`;
+  const tmp = path.join(registryDir, `${name}.${process.pid}.${Date.now()}.tmp`);
+  await writeFile(tmp, `${JSON.stringify(serializableRegistryEntry(normalized))}\n`, { mode: 0o600 });
+  await rename(tmp, path.join(registryDir, name));
+  return normalized;
+}
+
+export async function readRegistry(registryDir = defaultRegistryDir()) {
+  let entries;
+  try {
+    entries = await readdir(registryDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const registry = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    try {
+      const parsed = JSON.parse(await readFile(path.join(registryDir, entry.name), 'utf8'));
+      const normalized = normalizeRegistryEntry(parsed);
+      if (normalized) registry.push(normalized);
+    } catch {
+      // Ignore broken registry files; they must not break snapshots or leak paths.
+    }
+  }
+  return registry;
+}
+
+export async function registryEntriesForPanes(panes, registryDir = defaultRegistryDir()) {
+  const paneById = new Map(panes.filter((pane) => pane.paneId).map((pane) => [pane.paneId, pane]));
+  const byPane = new Map();
+  for (const entry of await readRegistry(registryDir)) {
+    const pane = paneById.get(entry.paneId);
+    if (!pane) continue;
+    if (entry.cwd && pane.cwd && entry.cwd !== pane.cwd) continue;
+
+    const state = entry.state !== 'stopped' && entry.pid && !pidAlive(entry.pid) ? 'stopped' : entry.state;
+    byPane.set(entry.paneId, { ...entry, state });
+  }
+  return byPane;
+}
+
+async function piSessionForRegistryEntry(entry, piRoot) {
+  const fromFile = entry.sessionFile ? await piSessionFromFile(entry.sessionFile) : null;
+  const session = fromFile || (entry.cwd ? await latestPiSessionForCwd(entry.cwd, piRoot) : null) || {};
+  return {
+    ...session,
+    file: session.file || entry.sessionFile,
+    liveLast: entry.last,
+    lastToolName: entry.lastToolName,
+    registryState: entry.state,
+    registryUpdatedAt: entry.updatedAt,
+  };
+}
+
+async function piSessionFromFile(file) {
+  try {
+    const info = await stat(file);
+    const text = await readFile(file, 'utf8');
+    return { ...parsePiSessionText(text), file, fileUpdatedAt: new Date(info.mtimeMs) };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRegistryEntry(entry) {
+  if (!entry || typeof entry !== 'object' || typeof entry.paneId !== 'string' || !entry.paneId) return null;
+  const state = normalizeRegistryState(entry.state || 'working');
+  const updatedAt = parseTimestamp(entry.updatedAt) || new Date();
+  return removeUndefined({
+    version: 1,
+    cwd: typeof entry.cwd === 'string' ? entry.cwd : undefined,
+    last: typeof entry.last === 'string' ? entry.last : undefined,
+    lastToolName: typeof entry.lastToolName === 'string' ? entry.lastToolName : undefined,
+    paneId: entry.paneId,
+    pid: Number.isInteger(entry.pid) && entry.pid > 0 ? entry.pid : undefined,
+    sessionFile: typeof entry.sessionFile === 'string' ? entry.sessionFile : undefined,
+    state,
+    updatedAt,
+  });
+}
+
+function serializableRegistryEntry(entry) {
+  return removeUndefined({ ...entry, updatedAt: entry.updatedAt.toISOString() });
+}
+
+function normalizeRegistryState(state) {
+  if (['error', 'stopped', 'waiting', 'working'].includes(state)) return state;
+  throw new Error('unknown registry state');
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeUndefined(object) {
+  return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+}
+
+function defaultRegistryDir() {
+  return process.env.PI_TMUX_HUB_REGISTRY_DIR || DEFAULT_REGISTRY_DIR;
 }
 
 export async function latestPiSessionForCwd(cwd, piRoot = DEFAULT_PI_ROOT) {
@@ -201,12 +368,8 @@ export async function latestPiSessionForCwd(cwd, piRoot = DEFAULT_PI_ROOT) {
 
   files.sort((left, right) => right.mtimeMs - left.mtimeMs);
   for (const file of files) {
-    try {
-      const text = await readFile(file.path, 'utf8');
-      return { ...parsePiSessionText(text), file: file.path, fileUpdatedAt: new Date(file.mtimeMs) };
-    } catch {
-      // Skip unreadable session files; one bad log should not kill the hub or leak paths.
-    }
+    const session = await piSessionFromFile(file.path);
+    if (session) return session;
   }
   return null;
 }
@@ -284,6 +447,7 @@ export function parsePiSessionText(text) {
 }
 
 function parseTimestamp(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? new Date(value) : undefined;
   if (typeof value !== 'string') return undefined;
   const time = Date.parse(value);
   return Number.isFinite(time) ? new Date(time) : undefined;
@@ -298,7 +462,7 @@ async function printSnapshot(options) {
 }
 
 export function publicRow(row, options = {}) {
-  const updatedAt = row.pi?.lastTimestamp || row.pi?.fileUpdatedAt;
+  const updatedAt = row.pi?.registryUpdatedAt || row.pi?.lastTimestamp || row.pi?.fileUpdatedAt;
   return {
     state: row.state,
     target: row.target,
@@ -316,7 +480,7 @@ export function publicRow(row, options = {}) {
 function describePi(pi) {
   if (!pi) return '-';
   if (pi.lastToolName) return `tool:${pi.lastToolName}`;
-  return pi.lastStopReason || pi.lastRole || '-';
+  return pi.liveLast || pi.lastStopReason || pi.lastRole || '-';
 }
 
 export function renderTable(rows) {
@@ -359,6 +523,13 @@ function parseInterval(value) {
   return seconds;
 }
 
+function parsePid(value) {
+  if (!/^\d+$/.test(value)) throw new Error('--pid must be a positive integer');
+  const pid = Number(value);
+  if (pid < 1) throw new Error('--pid must be a positive integer');
+  return pid;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -370,6 +541,7 @@ Usage:
   pi-tmux-hub [--json] [--watch] [--interval <seconds>] [--full-paths]
   pi-tmux-hub jump <session:window.pane>
   pi-tmux-hub next [attention|error|working|waiting|target|name]
+  pi-tmux-hub register --state <working|waiting|error|stopped>
 
 Read-only tmux snapshot plus deterministic tmux navigation. No network, no tokens.
 
@@ -379,6 +551,7 @@ Options:
   --interval <seconds>   Watch refresh interval. Default: 5.
   --full-paths           Show cwd and Pi session file paths. Hidden by default.
   --pi-root <dir>        Pi session root. Default: ~/.pi/agent/sessions.
+  --registry-dir <dir>   Pi/tmux registry dir. Default: ~/.pi-tmux-hub/registry.
   --tmux <binary>        tmux binary. Default: tmux.
   -h, --help             Show help.`;
 }

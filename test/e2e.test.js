@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { piSessionDirNames } from '../src/hub.js';
+import { piSessionDirNames, writeRegistryEntry } from '../src/hub.js';
 
 const exec = promisify(execFile);
 const cli = path.resolve('bin/pi-tmux-hub.js');
@@ -75,6 +75,68 @@ test('end-to-end: real tmux panes plus Pi JSONL adapter', async (t) => {
     const piRow = fullRows.find((row) => row.name === 'E2E task');
     assert.ok(piRow.directory.includes(actualWorkDir));
     assert.ok(piRow.sessionFile.endsWith('session.jsonl'));
+  } finally {
+    await exec('tmux', ['-L', socket, 'kill-server']).catch(() => undefined);
+    await rm(tmp, { force: true, recursive: true });
+  }
+});
+
+test('end-to-end: registry disambiguates two Pi sessions in one cwd', async (t) => {
+  if (!(await hasTmux())) {
+    t.skip('tmux is not installed');
+    return;
+  }
+
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-registry-e2e-'));
+  const socket = `pi-tmux-hub-registry-${process.pid}-${Date.now()}`;
+  const tmuxWrap = path.join(tmp, 'tmuxwrap');
+  const piRoot = path.join(tmp, 'pi-sessions');
+  const registryDir = path.join(tmp, 'registry');
+  const workDir = path.join(tmp, 'work-repo');
+
+  await mkdir(piRoot);
+  await mkdir(workDir);
+  await writeFile(tmuxWrap, `#!/bin/sh\nexec tmux -L ${socket} "$@"\n`, { mode: 0o755 });
+
+  try {
+    await exec('tmux', ['-L', socket, 'new-session', '-d', '-s', 'hubtest', '-c', workDir, 'sleep 60']);
+    await exec('tmux', ['-L', socket, 'split-window', '-d', '-t', 'hubtest:0', '-c', workDir, 'sleep 60']);
+
+    const { stdout: paneOutput } = await exec('tmux', ['-L', socket, 'list-panes', '-a', '-F', '#{pane_id}\t#{pane_current_path}']);
+    const panes = paneOutput.trim().split('\n').map((line) => {
+      const [paneId, cwd] = line.split('\t');
+      return { paneId, cwd };
+    });
+    assert.equal(panes.length, 2);
+    const actualWorkDir = panes[0].cwd;
+    assert.ok(actualWorkDir.endsWith('work-repo'));
+
+    const sessionDir = path.join(piRoot, piSessionDirNames(actualWorkDir)[0]);
+    await mkdir(sessionDir);
+    const firstSession = path.join(sessionDir, 'first.jsonl');
+    const secondSession = path.join(sessionDir, 'second.jsonl');
+    await writeFile(firstSession, [
+      JSON.stringify({ type: 'session', version: 3, id: 'session-first', timestamp: '2026-01-01T00:00:00.000Z', cwd: actualWorkDir }),
+      JSON.stringify({ type: 'session_info', name: 'First registry task', timestamp: '2026-01-01T00:00:01.000Z' }),
+      JSON.stringify({ type: 'message', timestamp: '2026-01-01T00:00:02.000Z', message: { role: 'assistant', stopReason: 'stop', content: 'PROMPT_SENTINEL_DO_NOT_PRINT' } }),
+    ].join('\n'));
+    await writeFile(secondSession, [
+      JSON.stringify({ type: 'session', version: 3, id: 'session-second', timestamp: '2026-01-01T00:00:00.000Z', cwd: actualWorkDir }),
+      JSON.stringify({ type: 'session_info', name: 'Second registry task', timestamp: '2026-01-01T00:00:01.000Z' }),
+      JSON.stringify({ type: 'message', timestamp: '2026-01-01T00:00:02.000Z', message: { role: 'assistant', stopReason: 'stop', content: 'CODE_SENTINEL_DO_NOT_PRINT' } }),
+    ].join('\n'));
+
+    await writeRegistryEntry({ cwd: actualWorkDir, last: 'agent_start', paneId: panes[0].paneId, pid: process.pid, sessionFile: firstSession, state: 'working' }, registryDir);
+    await writeRegistryEntry({ cwd: actualWorkDir, last: 'stop', paneId: panes[1].paneId, pid: process.pid, sessionFile: secondSession, state: 'waiting' }, registryDir);
+
+    const { stdout: json } = await exec(process.execPath, [cli, '--tmux', tmuxWrap, '--pi-root', piRoot, '--registry-dir', registryDir, '--json']);
+    const rows = JSON.parse(json);
+
+    assert.ok(rows.some((row) => row.name === 'First registry task' && row.state === 'working'));
+    assert.ok(rows.some((row) => row.name === 'Second registry task' && row.state === 'waiting'));
+    assert.doesNotMatch(JSON.stringify(rows), new RegExp(escapeRegExp(actualWorkDir)));
+    assert.doesNotMatch(JSON.stringify(rows), new RegExp(escapeRegExp(registryDir)));
+    assert.doesNotMatch(JSON.stringify(rows), /PROMPT_SENTINEL|CODE_SENTINEL/);
   } finally {
     await exec('tmux', ['-L', socket, 'kill-server']).catch(() => undefined);
     await rm(tmp, { force: true, recursive: true });
