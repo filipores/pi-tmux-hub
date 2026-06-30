@@ -1,6 +1,6 @@
 # pi-tmux-hub
 
-A tmux-native, read-only monitor for Pi coding-agent sessions.
+A tmux-native monitor and pane jumper for Pi coding-agent sessions.
 
 It does not run an LLM, call the network, or try to become the agent runtime. tmux owns panes; Pi is an adapter via local session JSONL.
 
@@ -10,6 +10,9 @@ It does not run an LLM, call the network, or try to become the agent runtime. tm
 pi-tmux-hub
 pi-tmux-hub --watch
 pi-tmux-hub --json
+pi-tmux-hub jump agents:1.0
+pi-tmux-hub next
+pi-tmux-hub next working
 ```
 
 During local development:
@@ -22,9 +25,9 @@ node bin/pi-tmux-hub.js --watch --interval 2
 Example output:
 
 ```text
-STATE    TARGET    CMD   DIR       ADAPTER  PI NAME     AGE
-waiting  work:1.0  node  repo      pi       Fix parser  4m
-tmux     work:1.1  zsh   scratch   tmux     -           -
+STATE    TARGET    CMD   DIR       ADAPTER  PI NAME     LAST  AGE
+waiting  work:1.0  node  repo      pi       Fix parser  stop  4m
+tmux     work:1.1  zsh   scratch   tmux     -           -     -
 ```
 
 ## What it watches
@@ -32,6 +35,27 @@ tmux     work:1.1  zsh   scratch   tmux     -           -
 - `tmux list-panes -a` for panes, commands, and current directories.
 - `~/.pi/agent/sessions` for the latest Pi JSONL session matching a pane cwd.
 - `/name` / `--name` metadata when Pi has written `session_info` entries.
+
+## Navigation
+
+Use the `TARGET` column to jump into a session:
+
+```bash
+pi-tmux-hub jump work:1.0
+```
+
+Jump to the first attention pane (`error`, then `working`, then `waiting`):
+
+```bash
+pi-tmux-hub next
+```
+
+Or filter by state, target, or Pi session name substring:
+
+```bash
+pi-tmux-hub next working
+pi-tmux-hub next "Fix parser"
+```
 
 ## Options
 
@@ -47,7 +71,7 @@ tmux     work:1.1  zsh   scratch   tmux     -           -
 
 ## Privacy posture
 
-- Read-only by default.
+- Snapshot mode is read-only; `jump`/`next` only switch tmux focus.
 - No network calls.
 - No token usage.
 - No prompt or code text is printed.
@@ -55,7 +79,7 @@ tmux     work:1.1  zsh   scratch   tmux     -           -
 
 ## MVP limits
 
-- Snapshot/watch only; no `steer`, `follow_up`, `abort`, or pane control yet.
+- Snapshot/watch plus tmux focus switching only; no `steer`, `follow_up`, or `abort` yet.
 - Pi detection is cwd + latest session JSONL, not RPC live state.
 - tmux is required.
 

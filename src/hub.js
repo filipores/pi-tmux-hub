@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +24,16 @@ export async function main(argv) {
     return;
   }
 
+  if (options.action === 'jump') {
+    await jumpToTarget(options.tmux, options.target);
+    return;
+  }
+
+  if (options.action === 'next') {
+    await jumpToNext(options);
+    return;
+  }
+
   if (options.watch) {
     for (;;) {
       await printSnapshot(options);
@@ -36,10 +46,13 @@ export async function main(argv) {
 
 export function parseArgs(argv) {
   const options = {
+    action: 'snapshot',
     fullPaths: false,
     help: false,
     interval: 5,
     json: false,
+    selector: undefined,
+    target: undefined,
     piRoot: DEFAULT_PI_ROOT,
     tmux: 'tmux',
     watch: false,
@@ -47,6 +60,11 @@ export function parseArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    if ((arg === 'jump' || arg === 'next') && options.action === 'snapshot') {
+      options.action = arg;
+      continue;
+    }
+
     if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--full-paths') options.fullPaths = true;
@@ -57,9 +75,13 @@ export function parseArgs(argv) {
     else if (arg.startsWith('--tmux=')) options.tmux = requireNonEmpty(arg.slice('--tmux='.length), '--tmux');
     else if (arg === '--interval') options.interval = parseInterval(requireValue(argv, ++index, '--interval'));
     else if (arg.startsWith('--interval=')) options.interval = parseInterval(arg.slice('--interval='.length));
+    else if (!arg.startsWith('-') && options.action === 'jump' && !options.target) options.target = arg;
+    else if (!arg.startsWith('-') && options.action === 'next' && !options.selector) options.selector = arg;
     else throw new Error(`unknown option: ${arg}`);
   }
 
+  if (options.action === 'jump' && !options.target) throw new Error('jump requires a target like session:window.pane');
+  if (options.action !== 'snapshot' && options.watch) throw new Error('--watch only works with snapshots');
   return options;
 }
 
@@ -68,6 +90,59 @@ export async function snapshot(options = {}) {
   const panes = await listTmuxPanes(resolved.tmux);
   const rows = await Promise.all(panes.map((pane) => enrichPane(pane, resolved.piRoot)));
   return rows.sort((left, right) => left.target.localeCompare(right.target, undefined, { numeric: true }));
+}
+
+export async function jumpToNext(options = {}) {
+  const rows = await snapshot(options);
+  const row = firstMatch(rows, options.selector || 'attention');
+  if (!row) throw new Error(`no pane matches ${options.selector || 'attention'}`);
+  await jumpToTarget(options.tmux || 'tmux', row.target);
+}
+
+function firstMatch(rows, selector) {
+  if (selector === 'attention') {
+    const priority = new Map([['error', 0], ['working', 1], ['waiting', 2]]);
+    return rows
+      .filter((row) => priority.has(row.state))
+      .sort((left, right) => priority.get(left.state) - priority.get(right.state))[0];
+  }
+
+  return rows.find((row) => row.state === selector || row.target === selector || row.pi?.name?.includes(selector));
+}
+
+export async function jumpToTarget(tmux, target) {
+  const parsed = parseTarget(target);
+  await tmuxExec(tmux, ['select-window', '-t', parsed.windowTarget]);
+  await tmuxExec(tmux, ['select-pane', '-t', target]);
+
+  if (process.env.TMUX) {
+    await tmuxExec(tmux, ['switch-client', '-t', parsed.windowTarget]);
+    return;
+  }
+
+  await tmuxSpawn(tmux, ['attach-session', '-t', parsed.session]);
+}
+
+export function parseTarget(target) {
+  const match = String(target || '').match(/^([^:]+):(\d+)\.(\d+)$/);
+  if (!match) throw new Error('target must look like session:window.pane');
+  return { session: match[1], window: match[2], pane: match[3], windowTarget: `${match[1]}:${match[2]}` };
+}
+
+async function tmuxExec(tmux, args) {
+  try {
+    await exec(tmux, args);
+  } catch {
+    throw new Error('tmux target switch failed');
+  }
+}
+
+function tmuxSpawn(tmux, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(tmux, args, { stdio: 'inherit' });
+    child.on('error', () => reject(new Error('tmux attach failed')));
+    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error('tmux attach failed'))));
+  });
 }
 
 export async function listTmuxPanes(tmux = 'tmux') {
@@ -113,8 +188,7 @@ async function enrichPane(pane, piRoot) {
 export function classifyPane(pane, pi) {
   if (!pi) return 'tmux';
   if (pi.lastStopReason === 'error') return 'error';
-  if (pi.lastRole === 'toolResult' || pi.lastStopReason === 'toolUse') return 'working';
-  if (pi.lastRole === 'user') return 'queued';
+  if (pi.lastRole === 'toolResult' || pi.lastRole === 'user' || pi.lastStopReason === 'toolUse') return 'working';
   if (pi.lastStopReason === 'stop') return 'waiting';
   return SHELLS.has(pane.command) ? 'idle' : 'live';
 }
@@ -129,7 +203,7 @@ export async function latestPiSessionForCwd(cwd, piRoot = DEFAULT_PI_ROOT) {
   for (const file of files) {
     try {
       const text = await readFile(file.path, 'utf8');
-      return { ...parsePiSessionText(text), file: file.path };
+      return { ...parsePiSessionText(text), file: file.path, fileUpdatedAt: new Date(file.mtimeMs) };
     } catch {
       // Skip unreadable session files; one bad log should not kill the hub or leak paths.
     }
@@ -224,6 +298,7 @@ async function printSnapshot(options) {
 }
 
 export function publicRow(row, options = {}) {
+  const updatedAt = row.pi?.lastTimestamp || row.pi?.fileUpdatedAt;
   return {
     state: row.state,
     target: row.target,
@@ -231,16 +306,23 @@ export function publicRow(row, options = {}) {
     directory: options.fullPaths ? row.cwd : row.cwdName,
     adapter: row.adapter,
     name: row.pi?.name || '-',
-    updated: row.pi?.lastTimestamp?.toISOString() || '-',
-    age: formatAge(row.pi?.lastTimestamp),
+    last: describePi(row.pi),
+    updated: updatedAt?.toISOString() || '-',
+    age: formatAge(updatedAt),
     ...(options.fullPaths && row.pi?.file ? { sessionFile: row.pi.file } : {}),
   };
 }
 
+function describePi(pi) {
+  if (!pi) return '-';
+  if (pi.lastToolName) return `tool:${pi.lastToolName}`;
+  return pi.lastStopReason || pi.lastRole || '-';
+}
+
 export function renderTable(rows) {
   const table = [
-    ['STATE', 'TARGET', 'CMD', 'DIR', 'ADAPTER', 'PI NAME', 'AGE'],
-    ...rows.map((row) => [row.state, row.target, row.command, row.directory, row.adapter, row.name, row.age]),
+    ['STATE', 'TARGET', 'CMD', 'DIR', 'ADAPTER', 'PI NAME', 'LAST', 'AGE'],
+    ...rows.map((row) => [row.state, row.target, row.command, row.directory, row.adapter, row.name, row.last, row.age]),
   ];
   const widths = table[0].map((_, index) => Math.max(...table.map((row) => printable(row[index]).length)));
   return table.map((row) => row.map((cell, index) => printable(cell).padEnd(widths[index])).join('  ').trimEnd()).join('\n');
@@ -286,8 +368,10 @@ function helpText() {
 
 Usage:
   pi-tmux-hub [--json] [--watch] [--interval <seconds>] [--full-paths]
+  pi-tmux-hub jump <session:window.pane>
+  pi-tmux-hub next [attention|error|working|waiting|target|name]
 
-Read-only tmux snapshot with a Pi JSONL adapter. No network, no tokens, no controls.
+Read-only tmux snapshot plus deterministic tmux navigation. No network, no tokens.
 
 Options:
   --json                 Print machine-readable rows.

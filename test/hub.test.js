@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
   classifyPane,
+  jumpToTarget,
   latestPiSessionForCwd,
   parseArgs,
   parsePiSessionText,
+  parseTarget,
   parseTmuxPanes,
   piSessionDirNames,
   publicRow,
@@ -91,8 +93,40 @@ test('classifies Pi states from session metadata', () => {
   assert.equal(classifyPane(pane, null), 'tmux');
   assert.equal(classifyPane(pane, { lastStopReason: 'error' }), 'error');
   assert.equal(classifyPane(pane, { lastStopReason: 'toolUse' }), 'working');
-  assert.equal(classifyPane(pane, { lastRole: 'user' }), 'queued');
+  assert.equal(classifyPane(pane, { lastRole: 'user' }), 'working');
   assert.equal(classifyPane(pane, { lastStopReason: 'stop' }), 'waiting');
+});
+
+test('parses tmux jump targets', () => {
+  assert.deepEqual(parseTarget('agents:1.2'), {
+    session: 'agents',
+    window: '1',
+    pane: '2',
+    windowTarget: 'agents:1',
+  });
+  assert.throws(() => parseTarget('agents'), /target must look like/);
+});
+
+test('jump switches window and pane inside tmux', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-jump-'));
+  const fakeTmux = path.join(dir, 'tmux');
+  const log = path.join(dir, 'calls.log');
+  await writeFile(fakeTmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(log)}\n`, { mode: 0o755 });
+
+  const oldTmux = process.env.TMUX;
+  process.env.TMUX = '/tmp/tmux-client';
+  try {
+    await jumpToTarget(fakeTmux, 'agents:1.2');
+  } finally {
+    if (oldTmux === undefined) delete process.env.TMUX;
+    else process.env.TMUX = oldTmux;
+  }
+
+  assert.deepEqual((await readFile(log, 'utf8')).trim().split('\n'), [
+    'select-window -t agents:1',
+    'select-pane -t agents:1.2',
+    'switch-client -t agents:1',
+  ]);
 });
 
 test('default public rows and table hide full local paths', () => {
@@ -105,6 +139,7 @@ test('default public rows and table hide full local paths', () => {
       file: '/Users/dev/.pi/agent/sessions/SECRET/session.jsonl',
       name: 'Task',
       lastTimestamp: new Date(),
+      lastStopReason: 'stop',
     },
     state: 'waiting',
     target: 'work:0.0',
@@ -112,20 +147,43 @@ test('default public rows and table hide full local paths', () => {
   const table = renderTable([row]);
 
   assert.equal(row.directory, 'SECRET_REPO');
+  assert.equal(row.last, 'stop');
   assert.equal('sessionFile' in row, false);
   assert.doesNotMatch(JSON.stringify(row) + table, /\/Users\/dev/);
 });
 
 test('argument parser keeps watch cheap and explicit', () => {
   assert.deepEqual(parseArgs(['--json', '--watch', '--interval', '2', '--pi-root=/tmp/pi', '--tmux', 'tmux']), {
+    action: 'snapshot',
     fullPaths: false,
     help: false,
     interval: 2,
     json: true,
+    selector: undefined,
+    target: undefined,
     piRoot: '/tmp/pi',
     tmux: 'tmux',
     watch: true,
   });
 
+  assert.deepEqual(parseArgs(['jump', 'agents:1.0']), {
+    action: 'jump',
+    fullPaths: false,
+    help: false,
+    interval: 5,
+    json: false,
+    selector: undefined,
+    target: 'agents:1.0',
+    piRoot: `${process.env.HOME}/.pi/agent/sessions`,
+    tmux: 'tmux',
+    watch: false,
+  });
+
+  assert.equal(parseArgs(['next', 'working']).selector, 'working');
   assert.throws(() => parseArgs(['--interval', '0']), /positive integer/);
+  assert.throws(() => parseArgs(['jump']), /jump requires/);
 });
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
