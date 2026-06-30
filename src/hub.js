@@ -125,10 +125,16 @@ export async function latestPiSessionForCwd(cwd, piRoot = DEFAULT_PI_ROOT) {
     for (const file of await jsonlFiles(path.join(piRoot, dirName))) files.push(file);
   }
 
-  if (files.length === 0) return null;
   files.sort((left, right) => right.mtimeMs - left.mtimeMs);
-  const text = await readFile(files[0].path, 'utf8');
-  return { ...parsePiSessionText(text), file: files[0].path };
+  for (const file of files) {
+    try {
+      const text = await readFile(file.path, 'utf8');
+      return { ...parsePiSessionText(text), file: file.path };
+    } catch {
+      // Skip unreadable session files; one bad log should not kill the hub or leak paths.
+    }
+  }
+  return null;
 }
 
 export function piSessionDirNames(cwd) {
@@ -142,17 +148,20 @@ async function jsonlFiles(dir) {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return [];
-    throw error;
+  } catch {
+    return [];
   }
 
   const files = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
     const file = path.join(dir, entry.name);
-    const info = await stat(file);
-    files.push({ path: file, mtimeMs: info.mtimeMs });
+    try {
+      const info = await stat(file);
+      files.push({ path: file, mtimeMs: info.mtimeMs });
+    } catch {
+      // Ignore files that disappear or become unreadable while the hub scans.
+    }
   }
   return files;
 }

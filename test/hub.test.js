@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   classifyPane,
+  latestPiSessionForCwd,
   parseArgs,
   parsePiSessionText,
   parseTmuxPanes,
@@ -50,6 +54,34 @@ test('parses Pi session metadata without exposing message text', () => {
   assert.equal(session.lastToolName, 'bash');
   assert.equal(session.lastTimestamp.toISOString(), '2026-01-01T00:02:00.000Z');
   assert.equal(session.malformedLines, 1);
+  assert.doesNotMatch(JSON.stringify(session), /PROMPT_SENTINEL/);
+});
+
+test('skips broken Pi session dirs without leaking path errors', async () => {
+  const piRoot = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-'));
+  const cwd = path.join(os.tmpdir(), 'SECRET_CWD_SENTINEL');
+  await writeFile(path.join(piRoot, piSessionDirNames(cwd)[0]), 'not a dir');
+
+  const session = await latestPiSessionForCwd(cwd, piRoot);
+
+  assert.equal(session, null);
+});
+
+test('finds latest Pi session for cwd', async () => {
+  const piRoot = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-'));
+  const cwd = path.join(os.tmpdir(), 'pi-tmux-hub-cwd');
+  const dir = path.join(piRoot, piSessionDirNames(cwd)[0]);
+  await mkdir(dir);
+  await writeFile(path.join(dir, 'session.jsonl'), [
+    JSON.stringify({ type: 'session', id: 's1', timestamp: '2026-01-01T00:00:00.000Z', cwd }),
+    JSON.stringify({ type: 'session_info', name: 'E2E task' }),
+    JSON.stringify({ type: 'message', timestamp: '2026-01-01T00:01:00.000Z', message: { role: 'assistant', stopReason: 'stop', content: 'PROMPT_SENTINEL' } }),
+  ].join('\n'));
+
+  const session = await latestPiSessionForCwd(cwd, piRoot);
+
+  assert.equal(session.name, 'E2E task');
+  assert.equal(session.lastStopReason, 'stop');
   assert.doesNotMatch(JSON.stringify(session), /PROMPT_SENTINEL/);
 });
 
