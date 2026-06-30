@@ -4,9 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import { closeWorktree, spawnWorktree } from './worktree.js';
+
 const exec = promisify(execFile);
 const DEFAULT_PI_ROOT = path.join(os.homedir(), '.pi', 'agent', 'sessions');
 const DEFAULT_REGISTRY_DIR = path.join(os.homedir(), '.pi-tmux-hub', 'registry');
+const SIDEBAR_ROLE_OPTION = '@pi_tmux_hub_role';
+const SIDEBAR_ROLE = 'sidebar';
+const SIDEBAR_WIDTH = '35%';
 const TMUX_FORMAT = [
   '#{session_name}',
   '#{window_index}',
@@ -40,6 +45,23 @@ export async function main(argv) {
     return;
   }
 
+  if (options.action === 'sidebar') {
+    await toggleSidebar(options);
+    return;
+  }
+
+  if (options.action === 'spawn') {
+    const result = await spawnWorktree(options);
+    console.log(`spawned ${result.branch}`);
+    return;
+  }
+
+  if (options.action === 'close') {
+    const result = await closeWorktree(options);
+    console.log(result.deleted ? 'closed and deleted' : 'closed');
+    return;
+  }
+
   if (options.action === 'next') {
     await jumpToNext(options);
     return;
@@ -65,6 +87,10 @@ export function parseArgs(argv) {
     last: undefined,
     lastToolName: undefined,
     paneId: process.env.TMUX_PANE,
+    command: 'pi',
+    deleteWorktree: false,
+    force: false,
+    nameParts: [],
     pid: process.pid,
     registryDir: defaultRegistryDir(),
     selector: undefined,
@@ -79,7 +105,7 @@ export function parseArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if ((arg === 'hub' || arg === 'jump' || arg === 'next' || arg === 'register') && options.action === 'snapshot') {
+    if ((arg === 'close' || arg === 'hub' || arg === 'jump' || arg === 'next' || arg === 'register' || arg === 'sidebar' || arg === 'spawn') && options.action === 'snapshot') {
       options.action = arg;
       continue;
     }
@@ -88,6 +114,12 @@ export function parseArgs(argv) {
     else if (arg === '--json') options.json = true;
     else if (arg === '--full-paths') options.fullPaths = true;
     else if (arg === '--watch') options.watch = true;
+    else if (arg === '--delete-worktree') options.deleteWorktree = true;
+    else if (arg === '--force') options.force = true;
+    else if (arg === '--command') options.command = requireValue(argv, ++index, '--command');
+    else if (arg.startsWith('--command=')) options.command = requireNonEmpty(arg.slice('--command='.length), '--command');
+    else if (arg === '--target') options.target = requireValue(argv, ++index, '--target');
+    else if (arg.startsWith('--target=')) options.target = requireNonEmpty(arg.slice('--target='.length), '--target');
     else if (arg === '--pi-root') options.piRoot = requireValue(argv, ++index, '--pi-root');
     else if (arg.startsWith('--pi-root=')) options.piRoot = requireNonEmpty(arg.slice('--pi-root='.length), '--pi-root');
     else if (arg === '--registry-dir') options.registryDir = requireValue(argv, ++index, '--registry-dir');
@@ -112,12 +144,18 @@ export function parseArgs(argv) {
     else if (arg.startsWith('--interval=')) options.interval = parseInterval(arg.slice('--interval='.length));
     else if (!arg.startsWith('-') && options.action === 'jump' && !options.target) options.target = arg;
     else if (!arg.startsWith('-') && options.action === 'next' && !options.selector) options.selector = arg;
+    else if (!arg.startsWith('-') && options.action === 'close' && !options.target) options.target = arg;
+    else if (!arg.startsWith('-') && options.action === 'spawn') options.nameParts.push(arg);
     else throw new Error(`unknown option: ${arg}`);
   }
+
+  options.name = options.nameParts.join(' ');
 
   if (options.action === 'jump' && !options.target) throw new Error('jump requires a target like session:window.pane');
   if (options.action === 'register' && !options.paneId) throw new Error('register requires --pane-id or TMUX_PANE');
   if (options.action === 'hub' && options.json) throw new Error('hub is interactive; use snapshot --json instead');
+  if (options.action === 'sidebar' && options.json) throw new Error('sidebar is interactive; use snapshot --json instead');
+  if (options.action === 'spawn' && !options.name) throw new Error('spawn requires a name');
   if (options.action !== 'snapshot' && options.watch) throw new Error('--watch only works with snapshots');
   return options;
 }
@@ -206,6 +244,65 @@ export async function runHub(options = {}) {
   timer = setInterval(() => { void refresh(); }, options.interval * 1000);
   await refresh();
   return done;
+}
+
+export async function toggleSidebar(options = {}) {
+  try {
+    const tmux = options.tmux || 'tmux';
+    const current = parseCurrentPane(await tmuxOutput(tmux, ['display-message', '-p', '#{window_id}\t#{pane_id}\t#{pane_current_path}']));
+    const existing = findSidebarPane(await tmuxOutput(tmux, ['list-panes', '-t', current.windowId, '-F', `#{pane_id}\t#{${SIDEBAR_ROLE_OPTION}}`]));
+    if (existing) {
+      await tmuxExec(tmux, ['kill-pane', '-t', existing]);
+      return { action: 'closed', paneId: existing };
+    }
+
+    const paneId = (await tmuxOutput(tmux, [
+      'split-window',
+      '-h',
+      '-l',
+      SIDEBAR_WIDTH,
+      '-t',
+      current.windowId,
+      '-c',
+      current.cwd || process.cwd(),
+      '-P',
+      '-F',
+      '#{pane_id}',
+      hubCommand(options),
+    ])).trim();
+    if (!paneId) throw new Error('empty sidebar pane');
+    await tmuxExec(tmux, ['set-option', '-p', '-t', paneId, SIDEBAR_ROLE_OPTION, SIDEBAR_ROLE]);
+    await tmuxExec(tmux, ['select-pane', '-t', current.paneId]);
+    return { action: 'opened', paneId };
+  } catch {
+    throw new Error('sidebar toggle failed');
+  }
+}
+
+function parseCurrentPane(stdout) {
+  const [windowId, paneId, cwd] = stdout.trimEnd().split('\t');
+  if (!windowId || !paneId) throw new Error('missing current pane');
+  return { windowId, paneId, cwd };
+}
+
+function findSidebarPane(stdout) {
+  for (const line of stdout.split(/\r?\n/)) {
+    const [paneId, role] = line.split('\t');
+    if (paneId && role === SIDEBAR_ROLE) return paneId;
+  }
+  return undefined;
+}
+
+function hubCommand(options) {
+  const cli = process.argv[1] ? path.resolve(process.argv[1]) : 'pi-tmux-hub';
+  const args = [process.execPath, cli, 'hub', '--tmux', options.tmux || 'tmux', '--pi-root', options.piRoot || DEFAULT_PI_ROOT, '--registry-dir', options.registryDir || defaultRegistryDir(), '--interval', String(options.interval || 5)];
+  if (options.fullPaths) args.push('--full-paths');
+  return args.map(shellQuote).join(' ');
+}
+
+async function tmuxOutput(tmux, args) {
+  const { stdout } = await exec(tmux, args);
+  return stdout;
 }
 
 function firstMatch(rows, selector) {
@@ -594,6 +691,10 @@ function printable(value) {
   return String(value ?? '');
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
 function formatAge(date) {
   if (!date) return '-';
   const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
@@ -638,6 +739,9 @@ function helpText() {
 Usage:
   pi-tmux-hub [--json] [--watch] [--interval <seconds>] [--full-paths]
   pi-tmux-hub hub [--interval <seconds>]
+  pi-tmux-hub sidebar
+  pi-tmux-hub spawn <name> [--command <cmd>]
+  pi-tmux-hub close [target] [--delete-worktree] [--force]
   pi-tmux-hub jump <session:window.pane>
   pi-tmux-hub next [attention|error|working|waiting|target|name]
   pi-tmux-hub register --state <working|waiting|error|stopped>
@@ -646,6 +750,9 @@ Read-only tmux snapshot plus deterministic tmux navigation. No network, no token
 
 Commands:
   hub                    Open the interactive live selector.
+  sidebar                Toggle hub in a tmux side pane.
+  spawn <name>           Create .worktrees/<name>, branch agent/<name>, tmux window.
+  close                  Close a pi-tmux-hub spawned window; delete only with flags.
 
 Options:
   --json                 Print machine-readable rows.
@@ -655,5 +762,9 @@ Options:
   --pi-root <dir>        Pi session root. Default: ~/.pi/agent/sessions.
   --registry-dir <dir>   Pi/tmux registry dir. Default: ~/.pi-tmux-hub/registry.
   --tmux <binary>        tmux binary. Default: tmux.
+  --target <pane>        tmux target for spawn/close.
+  --command <cmd>        Command for spawned window. Default: pi.
+  --delete-worktree      With close, also remove managed worktree and branch.
+  --force                With --delete-worktree, force git worktree/branch removal.
   -h, --help             Show help.`;
 }

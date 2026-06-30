@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import piTmuxHubSensor from '../extensions/pi-tmux-hub-sensor.js';
 import {
@@ -21,8 +23,12 @@ import {
   renderHub,
   renderTable,
   snapshot,
+  toggleSidebar,
   writeRegistryEntry,
 } from '../src/hub.js';
+import { parseSpawnMarkers, slugify, worktreePathFor } from '../src/worktree.js';
+
+const exec = promisify(execFile);
 
 test('parses tmux pane rows', () => {
   const panes = parseTmuxPanes('work\t1\t0\t%3\tnode\t/Users/dev/repo\tpi\n');
@@ -44,6 +50,42 @@ test('builds likely Pi session directory names for cwd', () => {
     '---Users-dev-repo--',
     '--Users-dev-repo--',
   ]);
+});
+
+test('worktree helpers keep names and markers boring', () => {
+  assert.equal(slugify('Fix Parser!!'), 'fix-parser');
+  assert.equal(slugify('../SECRET'), 'secret');
+  assert.equal(worktreePathFor('/repo', 'fix-parser'), '/repo/.worktrees/fix-parser');
+  assert.deepEqual(parseSpawnMarkers('1\n/repo\n/repo/.worktrees/fix-parser\nagent/fix-parser\n@42\n'), {
+    branch: 'agent/fix-parser',
+    fromRepo: '/repo',
+    spawned: true,
+    windowId: '@42',
+    worktreePath: '/repo/.worktrees/fix-parser',
+  });
+});
+
+test('package includes tmux plugin entrypoint', async () => {
+  const packageJson = JSON.parse(await readFile('package.json', 'utf8'));
+  const plugin = await readFile('pi-tmux-hub.tmux', 'utf8');
+
+  assert.ok(packageJson.files.includes('pi-tmux-hub.tmux'));
+  assert.match(plugin, /@pi_tmux_hub_key/);
+  assert.match(plugin, /sidebar/);
+});
+
+test('tmux plugin registers sidebar binding without requiring real tmux', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-plugin-'));
+  const fakeTmux = path.join(dir, 'tmux');
+  const log = path.join(dir, 'tmux.log');
+  await writeFile(fakeTmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(log)}\nif [ "$1" = display-message ]; then printf 'h\\n'; fi\n`, { mode: 0o755 });
+
+  await exec('bash', ['pi-tmux-hub.tmux'], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+  const calls = await readFile(log, 'utf8');
+
+  assert.match(calls, /set -g @pi_tmux_hub_key h/);
+  assert.match(calls, /bind h run-shell .*sidebar/);
+  assert.doesNotMatch(calls, /@pi_tmux_hub_cmd/);
 });
 
 test('parses Pi session metadata without exposing message text', () => {
@@ -229,6 +271,36 @@ test('jump switches window and pane inside tmux', async () => {
   ]);
 });
 
+test('sidebar opens a marked tmux pane and restores focus', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-sidebar-'));
+  const fakeTmux = path.join(dir, 'tmux');
+  const log = path.join(dir, 'calls.log');
+  await writeFile(fakeTmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(log)}\nif [ "$1" = display-message ]; then printf '%s\\t%s\\t%s\\n' '@1' '%1' '/tmp/repo'; exit 0; fi\nif [ "$1" = list-panes ]; then printf '%s\\t%s\\n' '%1' ''; exit 0; fi\nif [ "$1" = split-window ]; then printf '%s\\n' '%9'; exit 0; fi\n`, { mode: 0o755 });
+
+  const result = await toggleSidebar({ interval: 2, piRoot: '/tmp/pi', registryDir: '/tmp/registry', tmux: fakeTmux });
+  const calls = (await readFile(log, 'utf8')).trim().split('\n');
+
+  assert.deepEqual(result, { action: 'opened', paneId: '%9' });
+  assert.ok(calls.some((line) => line.startsWith('split-window -h -l 35% -t @1 -c /tmp/repo -P -F #{pane_id} ')));
+  assert.ok(calls.some((line) => line.includes("'hub'")));
+  assert.ok(calls.includes('set-option -p -t %9 @pi_tmux_hub_role sidebar'));
+  assert.ok(calls.includes('select-pane -t %1'));
+});
+
+test('sidebar toggles off an existing sidebar pane', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-sidebar-'));
+  const fakeTmux = path.join(dir, 'tmux');
+  const log = path.join(dir, 'calls.log');
+  await writeFile(fakeTmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(log)}\nif [ "$1" = display-message ]; then printf '%s\\t%s\\t%s\\n' '@1' '%1' '/tmp/repo'; exit 0; fi\nif [ "$1" = list-panes ]; then printf '%s\\t%s\\n' '%9' 'sidebar'; exit 0; fi\n`, { mode: 0o755 });
+
+  const result = await toggleSidebar({ tmux: fakeTmux });
+  const calls = (await readFile(log, 'utf8')).trim().split('\n');
+
+  assert.deepEqual(result, { action: 'closed', paneId: '%9' });
+  assert.ok(calls.includes('kill-pane -t %9'));
+  assert.equal(calls.some((line) => line.startsWith('split-window ')), false);
+});
+
 test('default public rows and table hide full local paths', () => {
   const row = publicRow({
     adapter: 'pi',
@@ -299,11 +371,26 @@ test('argument parser keeps watch cheap and explicit', () => {
   const hub = parseArgs(['hub', '--interval', '1']);
   assert.equal(hub.action, 'hub');
   assert.equal(hub.interval, 1);
+  assert.equal(parseArgs(['sidebar']).action, 'sidebar');
+
+  const spawn = parseArgs(['spawn', 'fix', 'parser', '--command', 'sleep 60', '--target', 'work:0.0']);
+  assert.equal(spawn.action, 'spawn');
+  assert.equal(spawn.name, 'fix parser');
+  assert.equal(spawn.command, 'sleep 60');
+  assert.equal(spawn.target, 'work:0.0');
+
+  const close = parseArgs(['close', 'work:0.0', '--delete-worktree', '--force']);
+  assert.equal(close.action, 'close');
+  assert.equal(close.target, 'work:0.0');
+  assert.equal(close.deleteWorktree, true);
+  assert.equal(close.force, true);
 
   assert.equal(parseArgs(['next', 'working']).selector, 'working');
   assert.throws(() => parseArgs(['hub', '--json']), /interactive/);
+  assert.throws(() => parseArgs(['sidebar', '--json']), /interactive/);
   assert.throws(() => parseArgs(['--interval', '0']), /positive integer/);
   assert.throws(() => parseArgs(['--state', 'bad']), /unknown registry state/);
+  assert.throws(() => parseArgs(['spawn']), /spawn requires/);
   assert.throws(() => parseArgs(['jump']), /jump requires/);
 });
 

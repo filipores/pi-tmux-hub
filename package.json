@@ -29,6 +29,7 @@
     "bin",
     "extensions",
     "src",
+    "pi-tmux-hub.tmux",
     "README.md",
     "LICENSE"
   ]
