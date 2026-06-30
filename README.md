@@ -89,14 +89,14 @@ Keys:
 Load the tmux helper to bind `prefix h` to `pi-tmux-hub sidebar`:
 
 ```tmux
-run-shell ~/tools/pi-tmux-hub/pi-tmux-hub.tmux
+source-file ~/tools/pi-tmux-hub/pi-tmux-hub.tmux
 ```
 
 Override the key before loading:
 
 ```tmux
 set -g @pi_tmux_hub_key H
-run-shell ~/tools/pi-tmux-hub/pi-tmux-hub.tmux
+source-file ~/tools/pi-tmux-hub/pi-tmux-hub.tmux
 ```
 
 ## Worktree spawn and close

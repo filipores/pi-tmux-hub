@@ -1,14 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
 
 import piTmuxHubSensor from '../extensions/pi-tmux-hub-sensor.js';
 import {
   classifyPane,
+  hubInputKeys,
   hubSelectionIndex,
   jumpToTarget,
   latestPiSessionForCwd,
@@ -27,8 +26,6 @@ import {
   writeRegistryEntry,
 } from '../src/hub.js';
 import { parseSpawnMarkers, slugify, worktreePathFor } from '../src/worktree.js';
-
-const exec = promisify(execFile);
 
 test('parses tmux pane rows', () => {
   const panes = parseTmuxPanes('work\t1\t0\t%3\tnode\t/Users/dev/repo\tpi\n');
@@ -74,18 +71,12 @@ test('package includes tmux plugin entrypoint', async () => {
   assert.match(plugin, /sidebar/);
 });
 
-test('tmux plugin registers sidebar binding without requiring real tmux', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-plugin-'));
-  const fakeTmux = path.join(dir, 'tmux');
-  const log = path.join(dir, 'tmux.log');
-  await writeFile(fakeTmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(log)}\nif [ "$1" = display-message ]; then printf 'h\\n'; fi\n`, { mode: 0o755 });
+test('tmux plugin is source-file based', async () => {
+  const plugin = await readFile('pi-tmux-hub.tmux', 'utf8');
 
-  await exec('bash', ['pi-tmux-hub.tmux'], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
-  const calls = await readFile(log, 'utf8');
-
-  assert.match(calls, /set -g @pi_tmux_hub_key h/);
-  assert.match(calls, /bind h run-shell .*sidebar/);
-  assert.doesNotMatch(calls, /@pi_tmux_hub_cmd/);
+  assert.match(plugin, /current_file/);
+  assert.match(plugin, /bind "\$key" run-shell "\$hub_cmd sidebar"/);
+  assert.doesNotMatch(plugin, /BASH_SOURCE|@pi_tmux_hub_cmd/);
 });
 
 test('parses Pi session metadata without exposing message text', () => {
@@ -347,6 +338,8 @@ test('interactive hub renders selection without leaking paths', () => {
   assert.doesNotMatch(hub, /\/Users\/dev/);
   assert.equal(hubSelectionIndex(-1, 3), 2);
   assert.equal(hubSelectionIndex(3, 3), 0);
+  assert.deepEqual(hubInputKeys('j\r'), ['j', '\r']);
+  assert.deepEqual(hubInputKeys('\u001b[B\n'), ['\u001b[B', '\n']);
 });
 
 test('argument parser keeps watch cheap and explicit', () => {

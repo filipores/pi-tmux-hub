@@ -180,6 +180,28 @@ test('end-to-end: sidebar toggles a marked pane and restores focus', async (t) =
   }
 });
 
+test('end-to-end: tmux plugin source-file binds sidebar', async (t) => {
+  if (!(await hasTmux())) {
+    t.skip('tmux is not installed');
+    return;
+  }
+
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'pi-tmux-hub-plugin-e2e-'));
+  const socket = `pi-tmux-hub-plugin-${process.pid}-${Date.now()}`;
+
+  try {
+    await exec('tmux', ['-L', socket, 'new-session', '-d', '-s', 'hubtest', 'sleep 60']);
+    await exec('tmux', ['-L', socket, 'source-file', path.resolve('pi-tmux-hub.tmux')]);
+    await waitFor(async () => {
+      const { stdout } = await exec('tmux', ['-L', socket, 'list-keys', '-T', 'prefix']);
+      return stdout.includes('bind-key') && stdout.includes('sidebar');
+    });
+  } finally {
+    await exec('tmux', ['-L', socket, 'kill-server']).catch(() => undefined);
+    await rm(tmp, { force: true, recursive: true });
+  }
+});
+
 test('end-to-end: spawn creates and close deletes a managed worktree window', async (t) => {
   if (!(await hasTmux())) {
     t.skip('tmux is not installed');

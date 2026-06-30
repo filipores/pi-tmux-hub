@@ -228,13 +228,14 @@ export async function runHub(options = {}) {
     }
   };
   const onKey = (data) => {
-    const key = data.toString('utf8');
-    if (key === '\u0003' || key === '\u001b' || key === 'q') stop();
-    else if (key === 'j' || key === '\u001b[B') { selected = hubSelectionIndex(selected + 1, rows.length); void refresh(); }
-    else if (key === 'k' || key === '\u001b[A') { selected = hubSelectionIndex(selected - 1, rows.length); void refresh(); }
-    else if (key === 'r') void refresh('refreshed');
-    else if (key === 'n') void jump(firstMatch(rows, 'attention'));
-    else if (key === '\r' || key === '\n') void jump(rows[selected]);
+    for (const key of hubInputKeys(data.toString('utf8'))) {
+      if (key === '\u0003' || key === '\u001b' || key === 'q') stop();
+      else if (key === 'j' || key === '\u001b[B') { selected = hubSelectionIndex(selected + 1, rows.length); void refresh(); }
+      else if (key === 'k' || key === '\u001b[A') { selected = hubSelectionIndex(selected - 1, rows.length); void refresh(); }
+      else if (key === 'r') void refresh('refreshed');
+      else if (key === 'n') void jump(firstMatch(rows, 'attention'));
+      else if (key === '\r' || key === '\n') void jump(rows[selected]);
+    }
   };
 
   stdout.write('\x1b[?1049h\x1b[?25l');
@@ -244,6 +245,21 @@ export async function runHub(options = {}) {
   timer = setInterval(() => { void refresh(); }, options.interval * 1000);
   await refresh();
   return done;
+}
+
+export function hubInputKeys(input) {
+  const keys = [];
+  for (let index = 0; index < input.length;) {
+    const arrow = input.slice(index, index + 3);
+    if (arrow === '\u001b[A' || arrow === '\u001b[B') {
+      keys.push(arrow);
+      index += 3;
+    } else {
+      keys.push(input[index]);
+      index += 1;
+    }
+  }
+  return keys;
 }
 
 export async function toggleSidebar(options = {}) {
