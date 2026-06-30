@@ -1,0 +1,24 @@
+{
+  "name": "pi-tmux-hub",
+  "version": "0.1.0",
+  "description": "tmux-native monitor for Pi coding-agent sessions.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "pi-tmux-hub": "bin/pi-tmux-hub.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "snapshot": "node bin/pi-tmux-hub.js",
+    "watch": "node bin/pi-tmux-hub.js --watch"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
+}
